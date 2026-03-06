@@ -21,7 +21,48 @@ from typing import List, Optional
 
 import numpy as np
 
-from VRP.config import PROJECT_ROOT
+from VRP.config import (
+    MESH_PATH,
+    MESH_POSE,
+    MESH_TARGET_LENGTH,
+    PROJECT_ROOT,
+    ROBOT_RADIUS,
+)
+
+
+# ── Mesh proximity filter (cached) ───────────────────────────────────────────
+
+_SCALED_MESH = None   # trimesh.Trimesh, lazily loaded once
+
+
+def _get_scaled_mesh():
+    """Return the ship mesh with the same scale + pose as the occupancy grid.
+
+    The result is cached so subsequent calls are free.
+    """
+    global _SCALED_MESH
+    if _SCALED_MESH is not None:
+        return _SCALED_MESH
+
+    import trimesh
+    from scipy.spatial.transform import Rotation as R
+
+    raw = trimesh.load(MESH_PATH, force="mesh")
+    if isinstance(raw, trimesh.Scene):
+        raw = trimesh.util.concatenate(list(raw.geometry.values()))
+
+    longest = float(raw.extents.max())
+    if longest > 0:
+        raw.apply_scale(MESH_TARGET_LENGTH / longest)
+
+    T = np.eye(4)
+    T[:3, 3] = MESH_POSE[:3]
+    qw, qx, qy, qz = MESH_POSE[3:7]
+    T[:3, :3] = R.from_quat([qx, qy, qz, qw]).as_matrix()
+    raw.apply_transform(T)
+
+    _SCALED_MESH = raw
+    return _SCALED_MESH
 
 
 # ── Identity quaternion helper ────────────────────────────────────────────────
@@ -33,16 +74,62 @@ def _with_identity_quat(xyz: np.ndarray) -> List[List[float]]:
     return np.concatenate([xyz, quat], axis=1).tolist()
 
 
+def _with_random_quats(
+    xyz: np.ndarray,
+    rng: np.random.RandomState,
+    yaw_range: tuple = (0.0, 2 * np.pi),
+    pitch_range: tuple = (-np.pi / 4, np.pi / 4),
+) -> List[List[float]]:
+    """Append random yaw + pitch quaternions to an (N, 3) position array.
+
+    Orientation is a ZY Euler rotation: yaw about world-Z followed by pitch
+    about body-Y.  The resulting quaternion is [qw, qx, qy, qz].
+
+    Parameters
+    ----------
+    yaw_range   : uniform random range for yaw (radians).
+    pitch_range : uniform random range for pitch/elevation (radians).
+    """
+    N = len(xyz)
+    thetas = rng.uniform(*yaw_range, size=N)    # yaw angles
+    phis   = rng.uniform(*pitch_range, size=N)  # pitch/elevation angles
+
+    # Half-angles
+    ct = np.cos(thetas / 2); st = np.sin(thetas / 2)
+    cp = np.cos(phis   / 2); sp = np.sin(phis   / 2)
+
+    # Compound quaternion: q_yaw * q_pitch
+    #   q_yaw   = (ct, 0,  0,  st)
+    #   q_pitch = (cp, 0, sp,   0)
+    # Product → (ct*cp, -st*sp, ct*sp, st*cp)
+    qw = ct * cp
+    qx = -st * sp
+    qy =  ct * sp
+    qz =  st * cp
+
+    quats = np.column_stack([qw, qx, qy, qz])
+    return np.concatenate([xyz, quats], axis=1).tolist()
+
+
 # ── Source 1: Random free-space sampling ─────────────────────────────────────
 
 def load_random_waypoints(
     n: int,
     og,  # OccupancyGrid
     seed: Optional[int] = 42,
-    z_min: float = 0.3,
+    z_min: float = 0.5,
     z_max: Optional[float] = None,
+    x_min: Optional[float] = None,
+    x_max: Optional[float] = None,
+    y_min: Optional[float] = None,
+    y_max: Optional[float] = None,
+    mesh_clearance: Optional[float] = None,
+    max_attempts: int = 50_000,
 ) -> List[List[float]]:
-    """Sample ``n`` random free-space waypoints from the occupancy grid.
+    """Sample ``n`` random free-space waypoints via rejection sampling.
+
+    Uses fast rejection sampling instead of enumerating every free voxel,
+    which is critical for large grids (>10 M voxels).
 
     Parameters
     ----------
@@ -50,29 +137,85 @@ def load_random_waypoints(
     og      : OccupancyGrid instance.
     seed    : random seed for reproducibility.
     z_min   : minimum Z height (metres); points below are rejected.
-    z_max   : maximum Z height; ``None`` = no upper bound.
+    z_max   : maximum Z height; ``None`` = derived from grid bounds.
+    x_min, x_max : X range; ``None`` = derived from grid bounds.
+    y_min, y_max : Y range; ``None`` = derived from grid bounds.
+    mesh_clearance : minimum distance to the ship mesh surface (metres).
+        Defaults to ``ROBOT_RADIUS * 2``.  Set to 0 to disable.
+    max_attempts : total random samples before giving up.
     """
     rng = np.random.RandomState(seed)
 
-    # Gather free voxels that satisfy Z constraints
-    free_ijk = np.argwhere(~og.grid)                          # (F, 3)
-    centres  = og.voxel_to_world(free_ijk)                   # (F, 3)
+    # Derive default bounds from the occupancy grid extents
+    grid_min = og.origin
+    grid_max = og.origin + np.array(og.grid.shape) * og.resolution
+    if x_min is None:
+        x_min = float(grid_min[0])
+    if x_max is None:
+        x_max = float(grid_max[0])
+    if y_min is None:
+        y_min = float(grid_min[1])
+    if y_max is None:
+        y_max = float(grid_max[1])
+    if z_max is None:
+        z_max = float(grid_max[2])
+    if mesh_clearance is None:
+        mesh_clearance = ROBOT_RADIUS * 2.0
 
-    z_mask = centres[:, 2] >= z_min
-    if z_max is not None:
-        z_mask &= centres[:, 2] <= z_max
-    centres = centres[z_mask]
+    print(f"[WaypointLoader] Sampling {n} waypoints  "
+          f"x=[{x_min:.1f},{x_max:.1f}] y=[{y_min:.1f},{y_max:.1f}] "
+          f"z=[{z_min:.1f},{z_max:.1f}]  clearance={mesh_clearance:.2f}m")
 
-    if len(centres) < n:
+    # Lazy-load mesh proximity checker only when needed
+    prox = None
+    if mesh_clearance > 0 and os.path.isfile(MESH_PATH):
+        import trimesh
+        mesh = _get_scaled_mesh()
+        prox = trimesh.proximity.ProximityQuery(mesh)
+
+    # ── Rejection sampling (fast for large grids) ─────────────────────
+    grid_shape = np.array(og.grid.shape)
+    collected: List[np.ndarray] = []
+    batch_size = max(n * 50, 500)
+    total_tried = 0
+
+    while len(collected) < n and total_tried < max_attempts:
+        # Generate random world-frame points within the sampling box
+        pts = np.column_stack([
+            rng.uniform(x_min, x_max, batch_size),
+            rng.uniform(y_min, y_max, batch_size),
+            rng.uniform(z_min, z_max, batch_size),
+        ])
+        total_tried += batch_size
+
+        # Convert to voxel indices and check occupancy grid
+        ijk = og.world_to_voxel(pts)
+        in_bounds = np.all(ijk >= 0, axis=1) & np.all(ijk < grid_shape, axis=1)
+        pts = pts[in_bounds]
+        ijk = ijk[in_bounds]
+        free_mask = ~og.grid[ijk[:, 0], ijk[:, 1], ijk[:, 2]]
+        pts = pts[free_mask]
+
+        # Mesh proximity filter (only on the few surviving candidates)
+        if prox is not None and len(pts) > 0:
+            _, dists, _ = prox.on_surface(pts)
+            pts = pts[dists >= mesh_clearance]
+
+        for p in pts:
+            if len(collected) >= n:
+                break
+            collected.append(p)
+
+    if len(collected) < n:
         raise ValueError(
-            f"Only {len(centres)} voxels satisfy Z constraints; requested {n}."
+            f"Only {len(collected)} valid points found after {total_tried} "
+            f"attempts; requested {n}.  Try relaxing the bounds or "
+            f"reducing mesh_clearance."
         )
 
-    chosen = centres[rng.choice(len(centres), n, replace=False)]
-    # Add sub-voxel jitter
-    jitter = rng.uniform(-og.resolution * 0.4, og.resolution * 0.4, size=(n, 3))
-    chosen = chosen + jitter
-    return _with_identity_quat(chosen)
+    chosen = np.array(collected[:n])
+    print(f"[WaypointLoader] Sampled {n} waypoints in {total_tried} attempts")
+    return _with_random_quats(chosen, rng)
 
 
 # ── Source 2: JSON / NPZ file ─────────────────────────────────────────────────

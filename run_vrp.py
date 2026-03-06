@@ -5,17 +5,17 @@ VRP Planner – CLI Entry Point
 Usage examples
 --------------
 
-Random 5 waypoints, 2 AUVs (auto backend: cuOpt → OR-Tools):
-    python run_vrp.py --num_robots 2 --random_waypoints 5
+Random 5 waypoints, 2 AUVs (auto backend: cuOpt → OR-Tools), save solution:
+    python run_vrp.py --num_robots 2 --random_waypoints 5 --save_solution solution.pkl
 
 Load waypoints from JSON, 3 AUVs, force OR-Tools:
-    python run_vrp.py --num_robots 3 --waypoints_file waypoints.json --solver ortools
+    python run_vrp.py --num_robots 3 --waypoints_file waypoints.json --solver ortools --save_solution sol.pkl
 
 Import waypoints from 3D-Inspection output:
-    python run_vrp.py --num_robots 2 --waypoints_from_inspection 3D-Inspection/methods_analysis/models
+    python run_vrp.py --num_robots 2 --waypoints_from_inspection 3D-Inspection/methods_analysis/models --save_solution sol.pkl
 
-Replay in Isaac Sim after planning:
-    python run_vrp.py --num_robots 2 --random_waypoints 6 --replay
+Visualize a previously planned solution in Isaac Sim (activate Isaac Sim env first):
+    python VRP/visualize_solution.py --solution_file solution.pkl
 """
 
 from __future__ import annotations
@@ -42,10 +42,8 @@ def parse_args() -> argparse.Namespace:
     # ── Robot / simulation ─────────────────────────────────────────────
     p.add_argument("--num_robots", "-n", type=int, default=2,
                    help="Number of AUV robots.")
-    p.add_argument("--replay", action="store_true",
-                   help="Replay planned trajectories in Isaac Sim.")
     p.add_argument("--headless", action="store_true",
-                   help="Run Isaac Sim in headless mode (no GUI).")
+                   help="Isaac Sim headless flag (passed through to visualize_solution.py).")
 
     # ── Waypoint source ────────────────────────────────────────────────
     wp_group = p.add_mutually_exclusive_group()
@@ -65,8 +63,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--solver", choices=["auto", "cuopt", "ortools"],
                    default="auto",
                    help="VRP backend: 'auto' tries cuOpt then falls back to OR-Tools.")
-    p.add_argument("--depot", type=int, default=0,
-                   help="Waypoint index used as depot for all vehicles.")
     p.add_argument("--service_time", type=float, default=10.0,
                    help="Service time (s) at each waypoint (temporal separation).")
     p.add_argument("--ortools_time_limit", type=int, default=60,
@@ -75,7 +71,11 @@ def parse_args() -> argparse.Namespace:
                    help="cuOpt subprocess timeout (seconds).")
     p.add_argument("--rapids_python", type=str, default="",
                    help="Path to rapids_solver env Python (default: read from config).")
-
+    # ── Solution persistence ──────────────────────────────────
+    p.add_argument("--save_solution", type=str, default="vrp_solution.pkl",
+                   metavar="PATH",
+                   help="Save the planned ExecutionResult to PATH (.pkl). "
+                        "Load later with VRP/visualize_solution.py.")
     # ── Logging ───────────────────────────────────────────────────────
     p.add_argument("--verbose", "-v", action="store_true",
                    help="Enable DEBUG logging.")
@@ -115,9 +115,7 @@ def main():
         waypoint_source    = waypoint_source,
         n_random_waypoints = n_random,
         random_seed        = args.random_seed,
-        headless           = args.headless,
-        replay_in_isaac    = args.replay,
-        depot              = args.depot,
+        save_solution_path = args.save_solution,
     )
 
     # ── Run ───────────────────────────────────────────────────────────
@@ -132,6 +130,9 @@ def main():
     print(f"  Robots        : {args.num_robots}")
     print(f"  Waypoints     : {total_wps} total  ({total_fail} failed)")
     print(f"  Replay steps  : {len(result.all_traj_positions[0]) if result.all_traj_positions else 0}")
+    if args.save_solution:
+        print(f"  Solution saved: {args.save_solution}")
+        print(f"  Visualize with: python VRP/visualize_solution.py --solution_file {args.save_solution}")
     print("=" * 60)
 
 

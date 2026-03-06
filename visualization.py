@@ -17,13 +17,16 @@ from __future__ import annotations
 import logging
 import os
 import sys
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 
 from .config import (
     ASSETS_PATH,
     CONFIGS_PATH,
+    MESH_PATH,
+    MESH_POSE,
+    MESH_TARGET_LENGTH,
     STATIC_OBSTACLES,
 )
 from .route_executor import ExecutionResult
@@ -46,6 +49,68 @@ _COLORS = [
 ]
 
 
+# ─── Pose helpers ────────────────────────────────────────────────────────────
+
+def _traj8_to_pose(traj_pos: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Convert one 8-DOF joint position to ``(xyz, quat_wxyz)``.
+
+    The 8 DOFs are ``[x, y, z, yaw, pitch, roll, cam_yaw, cam_pitch]``.
+    """
+    from scipy.spatial.transform import Rotation as R
+    xyz = traj_pos[:3].copy().astype(np.float64)
+    yaw, pitch, roll = float(traj_pos[3]), float(traj_pos[4]), float(traj_pos[5])
+    rot = R.from_euler("ZYX", [yaw, pitch, roll])
+    qx, qy, qz, qw = rot.as_quat()
+    return xyz, np.array([qw, qx, qy, qz], dtype=np.float64)
+
+
+def _convert_trajectories(all_traj_positions: list) -> List[np.ndarray]:
+    """Pre-convert all robot trajectories to ``(N, 7)`` arrays of ``[x,y,z,qw,qx,qy,qz]``."""
+    result = []
+    for robot_traj in all_traj_positions:
+        converted = np.zeros((len(robot_traj), 7), dtype=np.float64)
+        for step, tp in enumerate(robot_traj):
+            xyz, qwxyz = _traj8_to_pose(tp)
+            converted[step, :3] = xyz
+            converted[step, 3:] = qwxyz
+        result.append(converted)
+    return result
+
+
+def _set_robot_pose(rob_prim, xyz: np.ndarray, qwxyz: np.ndarray) -> None:
+    """Teleport a USD prim by setting its xformOp:translate / xformOp:orient attributes."""
+    from pxr import Gf  # type: ignore
+    x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+    qw, qx, qy, qz = float(qwxyz[0]), float(qwxyz[1]), float(qwxyz[2]), float(qwxyz[3])
+
+    translate_attr = rob_prim.GetAttribute("xformOp:translate")
+    orient_attr    = rob_prim.GetAttribute("xformOp:orient")
+
+    if translate_attr and translate_attr.IsValid():
+        try:
+            translate_attr.Set(Gf.Vec3f(x, y, z))
+        except Exception:
+            try:
+                translate_attr.Set(Gf.Vec3d(x, y, z))
+            except Exception:
+                pass
+    else:
+        from pxr import UsdGeom  # type: ignore
+        UsdGeom.Xformable(rob_prim).AddTranslateOp().Set(Gf.Vec3f(x, y, z))
+
+    if orient_attr and orient_attr.IsValid():
+        try:
+            orient_attr.Set(Gf.Quatf(qw, qx, qy, qz))
+        except Exception:
+            try:
+                orient_attr.Set(Gf.Quatd(qw, qx, qy, qz))
+            except Exception:
+                pass
+    else:
+        from pxr import UsdGeom  # type: ignore
+        UsdGeom.Xformable(rob_prim).AddOrientOp().Set(Gf.Quatf(qw, qx, qy, qz))
+
+
 # ─── Public entry-point ──────────────────────────────────────────────────────
 
 def replay_in_isaac_sim(
@@ -61,12 +126,11 @@ def replay_in_isaac_sim(
     headless:
         If ``True``, run without a display (useful for CI / server use).
     """
-    all_traj_positions  = exec_result.all_traj_positions
-    all_traj_velocities = exec_result.all_traj_velocities
-    all_waypoints       = exec_result.all_waypoints
-    j_names             = exec_result.joint_names
-    num_robots          = len(all_traj_positions)
-    total_steps         = len(all_traj_positions[0]) if all_traj_positions else 0
+    all_traj_positions = exec_result.all_traj_positions
+    all_waypoints      = exec_result.all_waypoints
+    num_robots         = len(all_traj_positions)
+    total_steps        = max(len(t) for t in all_traj_positions) if all_traj_positions else 0
+    traj_poses         = _convert_trajectories(all_traj_positions)
 
     # ── Bootstrap Isaac Sim ───────────────────────────────────────────
     try:
@@ -90,7 +154,6 @@ def replay_in_isaac_sim(
     from omni.isaac.core import World
     from omni.isaac.core.objects import cuboid as cuboid_mod
     from omni.isaac.core.robots import Robot
-    from omni.isaac.core.utils.types import ArticulationAction
     from curobo.util.usd_helper import UsdHelper, set_prim_transform  # type: ignore
 
     ISAAC_SIM_45 = False
@@ -126,6 +189,16 @@ def replay_in_isaac_sim(
         ps.GetGravityMagnitudeAttr().Set(0.0)
     except Exception:
         pass
+
+    # ── Dome light ────────────────────────────────────────────────────
+    try:
+        from pxr import UsdLux  # type: ignore
+        dome_light = UsdLux.DomeLight.Define(stage, "/World/DomeLight")
+        dome_light.GetIntensityAttr().Set(800.0)
+        dome_light.GetColorAttr().Set(Gf.Vec3f(0.75, 0.85, 1.0))  # cool blue tint
+        logger.info("[viz] Dome light added.")
+    except Exception as _e:
+        logger.warning("[viz] Could not add dome light: %s", _e)
 
     xform = stage.DefinePrim("/World", "Xform")
     stage.SetDefaultPrim(xform)
@@ -180,8 +253,8 @@ def replay_in_isaac_sim(
     # ── Spawn robots ──────────────────────────────────────────────────
     import omni.usd  # type: ignore
 
-    robots            = []
-    art_controllers   = []
+    robots    = []
+    rob_prims = []
     for i in range(num_robots):
         dp = str(stage.GetDefaultPrim().GetPath())
         pp = omni.usd.get_stage_next_free_path(stage, dp + inner_prim_path, False)
@@ -189,7 +262,7 @@ def replay_in_isaac_sim(
         robot = Robot(prim_path=pp, name=f"brov_{i}")
         set_prim_transform(stage.GetPrimAtPath(pp), [0, 0, 0, 1, 0, 0, 0])
         robots.append(my_world.scene.add(robot))
-        art_controllers.append(None)
+        rob_prims.append(stage.GetPrimAtPath(pp))
         logger.info("[viz] Spawned robot %d  prim=%s", i, pp)
 
     # ── Static obstacles (mesh + cuboids) ─────────────────────────────
@@ -197,8 +270,31 @@ def replay_in_isaac_sim(
 
     usd_help = UsdHelper()
     usd_help.load_stage(stage)
+
+    # Build WorldConfig that includes the environment mesh AND cuboid obstacles
+    world_dict: dict = {"cuboid": STATIC_OBSTACLES}
+    if os.path.isfile(MESH_PATH):
+        # Compute the same uniform scale used by build_occupancy_grid()
+        import trimesh as _tm
+        _raw = _tm.load(MESH_PATH, force="mesh")
+        if isinstance(_raw, _tm.Scene):
+            _raw = _tm.util.concatenate(list(_raw.geometry.values()))
+        _longest = float(_raw.extents.max())
+        _mesh_scale = MESH_TARGET_LENGTH / _longest if _longest > 0 else 1.0
+
+        world_dict["mesh"] = {
+            "duke_of_lancaster": {
+                "file_path": MESH_PATH,
+                "pose": MESH_POSE,
+                "scale": [_mesh_scale, _mesh_scale, _mesh_scale],
+            }
+        }
+        logger.info("[viz] Adding mesh: %s  scale=%.4f", MESH_PATH, _mesh_scale)
+    else:
+        logger.warning("[viz] Mesh not found at %s – skipping.", MESH_PATH)
+
     usd_help.add_world_to_stage(
-        WorldConfig.from_dict({"cuboid": STATIC_OBSTACLES}),
+        WorldConfig.from_dict(world_dict),
         base_frame="/World",
     )
     my_world.scene.add_default_ground_plane()
@@ -227,82 +323,28 @@ def replay_in_isaac_sim(
     )
 
     # ── Replay loop ───────────────────────────────────────────────────
-    idx_lists:    List[Optional[List[int]]] = [None] * num_robots
-    replay_idx    = 0
-    initialised   = False
+    replay_idx = 0
+    playing    = False
 
     while simulation_app.is_running():
         my_world.step(render=True)
+
         if not my_world.is_playing():
+            playing = False
             continue
 
-        step_index = my_world.current_time_step_index
-
-        # Init articulation controllers + drive to first frame
-        if step_index <= 10:
-            for i in range(num_robots):
-                robots[i]._articulation_view.initialize()
-                art_controllers[i] = robots[i].get_articulation_controller()
-
-                il = []
-                for jn in j_names:
-                    try:
-                        il.append(robots[i].get_dof_index(jn))
-                    except Exception:
-                        pass
-                idx_lists[i] = il
-
-                if il:
-                    init_pos = all_traj_positions[i][0]
-                    robots[i].set_joint_positions(init_pos.tolist(), il)
-                    robots[i]._articulation_view.set_joint_position_targets(
-                        positions=np.array(init_pos, dtype=np.float32).reshape(1, -1),
-                        joint_indices=il,
-                    )
-                    robots[i]._articulation_view.set_joint_velocity_targets(
-                        velocities=np.zeros((1, len(il)), dtype=np.float32),
-                        joint_indices=il,
-                    )
-                    robots[i]._articulation_view.set_max_efforts(
-                        values=np.array([50_000.0] * len(il)),
-                        joint_indices=il,
-                    )
-            continue
-
-        # Settling: keep driving robots to start position
-        if step_index < 40:
-            for i in range(num_robots):
-                if idx_lists[i] and art_controllers[i]:
-                    init_pos = all_traj_positions[i][0]
-                    art_controllers[i].apply_action(ArticulationAction(
-                        init_pos,
-                        np.zeros_like(init_pos),
-                        joint_indices=idx_lists[i],
-                    ))
-            continue
-
-        if not initialised:
-            initialised = True
-            replay_idx  = 0
+        if not playing:
+            replay_idx = 0
+            playing    = True
             logger.info("[viz] Replay started.")
 
         if replay_idx >= total_steps:
             logger.info("[viz] Replay finished – looping.")
             replay_idx = 0
 
-        # Drive articulations
-        for i in range(num_robots):
-            if not idx_lists[i] or art_controllers[i] is None:
-                continue
-            tp = all_traj_positions[i][replay_idx]
-            tv = all_traj_velocities[i][replay_idx]
-            art_controllers[i].apply_action(ArticulationAction(
-                tp, tv, joint_indices=idx_lists[i],
-            ))
-
-        # Sub-step physics for better tracking accuracy
-        for _ in range(4):
-            my_world.step(render=False)
+        for i, prim in enumerate(rob_prims):
+            safe_idx = min(replay_idx, len(traj_poses[i]) - 1)
+            _set_robot_pose(prim, traj_poses[i][safe_idx, :3], traj_poses[i][safe_idx, 3:])
 
         replay_idx += 1
         if replay_idx % 500 == 0:

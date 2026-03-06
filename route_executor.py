@@ -1,50 +1,57 @@
 """
-VRP Planner – Route Executor
+VRP Planner – Route Executor (Priority-Based Sequential Planning)
 
-Executes per-vehicle waypoint routes produced by the VRP solver with
-traffic-light wait injections.  The planner priority order is preserved
-from the original ``run_multi_auv_waypoints.py`` reference:
+Builds per-vehicle trajectories that are **collision-free by construction**.
+Robots are planned one at a time in priority order (longest route first).
+Each robot's route is planned via Space-Time A* on a coarse 4-D grid so it
+avoids both static obstacles *and* previously committed robots'
+trajectories.  The coarse space-time path is then smoothly interpolated at
+the replay time-step (``TRAJ_DT``) and converted to 8-DOF joint space.
 
-* Higher-priority (lower index) robot's trajectory is committed first.
-* All committed trajectories feed into the next robot's planner as
-  trajectory OBB obstacles (via :func:`~utils.build_traj_obb_tensors`).
-* Post-execution AABB collision check triggers re-planning on conflict.
-
-Returns lists of per-step joint positions and velocities ready for the
-Isaac Sim visualisation phase.
+Pipeline
+--------
+1. Down-sample occupancy grid → coarse grid for Space-Time A*.
+2. Initialise a dense 4-D reservation table.
+3. Sort robots by estimated route cost (longest first = highest priority).
+4. For each robot (priority order):
+   a.  Plan each route leg with Space-Time A*, building a coarse
+       time-stamped XYZ path.
+   b.  Commit the trajectory to the reservation table so later robots
+       avoid it.
+   c.  Smooth-interpolate the coarse path at TRAJ_DT for replay.
+5. Run a final AABB safety check (should be clean; log any residual).
 """
 
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+import math
+from dataclasses import dataclass
+from typing import List, Optional
 
 import numpy as np
-import torch
 
 from .config import (
+    AUV_CRUISE_SPEED,
     BROV_CUBOID_DIMS,
-    CUROBO_NUM_GRAPH_SEEDS,
-    CUROBO_NUM_TRAJOPT_SEEDS,
     ROBOT_RADIUS,
-    TRAJOPT_HORIZON,
+    SPACE_TIME_DT,
+    SPACE_TIME_DWELL_S,
+    SPACE_TIME_MAX_HORIZON_S,
+    SPACE_TIME_RESOLUTION,
+    SPLINE_SAFETY_VOXELS,
 )
-from .traffic_light import TrafficPlan
-from .trajectory_planner import HybridTrajectoryPlanner, SegmentResult
-from .utils import (
-    aabb_overlap,
-    build_traj_obb_tensors,
-    find_trajectory_collisions,
+from .space_time_astar import (
+    ReservationTable,
+    downsample_occupancy_grid,
+    plan_robot_route_st,
 )
+from .utils import find_trajectory_collisions
 
 logger = logging.getLogger(__name__)
 
-# Number of hold-steps appended after each waypoint
-WAIT_STEPS = 25
-
-# Max re-plan attempts per segment when AABB post-check fires
-MAX_REPLAN_ATTEMPTS = 3
+# ── Trajectory interpolation defaults ─────────────────────────────────────────
+TRAJ_DT = 0.02  # seconds – replay sample period
 
 
 # ─── Result dataclass ────────────────────────────────────────────────────────
@@ -80,39 +87,28 @@ class ExecutionResult:
 # ─── Executor ────────────────────────────────────────────────────────────────
 
 class RouteExecutor:
-    """Plans and commits trajectories for all vehicles according to their
-    VRP routes + traffic-light plan.
+    """Priority-Based Sequential Planner from Space-Time A* paths.
 
     Parameters
     ----------
-    motion_gens:
-        List of ``MotionGen`` instances, one per robot.
     start_configs:
         ``(num_robots, D)`` initial joint configurations.
     joint_names:
         Ordered joint name list.
     og:
-        Occupancy grid for RRT* fallback.
+        Occupancy grid (used to build the coarse grid for Space-Time A*).
     """
 
     def __init__(
         self,
-        motion_gens:    List,
         start_configs:  List[np.ndarray],
         joint_names:    List[str],
-        og,
+        og=None,
     ):
-        self.motion_gens   = motion_gens
-        self.num_robots    = len(motion_gens)
+        self.num_robots    = len(start_configs)
         self.start_configs = start_configs
         self.joint_names   = joint_names
         self.og            = og
-
-        # Build per-robot hybrid planners
-        self.planners = [
-            HybridTrajectoryPlanner(mg, og, robot_name=f"AUV-{i}")
-            for i, mg in enumerate(motion_gens)
-        ]
 
     # ──────────────────────────────────────────────────────────────────
 
@@ -120,172 +116,181 @@ class RouteExecutor:
         self,
         routes:          List[List[int]],
         waypoints_world: np.ndarray,
-        traffic_plan:    Optional[TrafficPlan] = None,
+        traffic_plan=None,
+        path_cache: Optional[dict] = None,
+        dwell_s: float = SPACE_TIME_DWELL_S,
     ) -> ExecutionResult:
-        """Execute all routes and return the full trajectory arrays.
-
-        Parameters
-        ----------
-        routes:
-            Per-vehicle ordered waypoint index lists (from VRP solver).
-        waypoints_world:
-            ``(N, 7)`` array ``[x, y, z, qw, qx, qy, qz]``.
-        traffic_plan:
-            Optional :class:`~traffic_light.TrafficPlan` with per-step
-            wait counts.
+        """Build collision-free trajectories via Priority-Based Sequential
+        Planning and return an :class:`ExecutionResult`.
         """
-        num_robots  = self.num_robots
-        n_robots    = num_robots
+        n_robots = self.num_robots
+        n_dof    = len(self.start_configs[0])  # 8
 
-        # Build all_waypoints list (per-robot list of [x,y,z,qw,qx,qy,qz])
-        all_waypoints: List[List[List[float]]] = []
-        for v, route in enumerate(routes):
-            all_waypoints.append([waypoints_world[wp_idx].tolist()
-                                   for wp_idx in route])
-
+        # Build per-robot waypoint list for visualisation
+        all_waypoints: List[List[List[float]]] = [
+            [waypoints_world[wp_idx].tolist() for wp_idx in route]
+            for route in routes
+        ]
         initial_positions = [cfg[:3].copy() for cfg in self.start_configs]
 
-        # ── Tracking buffers ──────────────────────────────────────────
+        # ── 1. Coarse grid + reservation table ────────────────────────
+        if self.og is not None:
+            coarse_grid, coarse_origin, coarse_res = downsample_occupancy_grid(
+                self.og.grid, self.og.origin, self.og.resolution,
+                coarse_res=SPACE_TIME_RESOLUTION,
+            )
+        else:
+            # No occupancy grid available – create an empty one
+            logger.warning("No occupancy grid; collision avoidance with "
+                           "static obstacles is disabled.")
+            coarse_grid = np.zeros((10, 10, 10), dtype=np.bool_)
+            coarse_origin = np.zeros(3)
+            coarse_res = SPACE_TIME_RESOLUTION
+
+        T_max = max(1, int(math.ceil(SPACE_TIME_MAX_HORIZON_S / SPACE_TIME_DT)))
+        # Robot AABB half-extents in coarse voxels (≥1 so at least the
+        # centre voxel is always reserved).  We add SPLINE_SAFETY_VOXELS
+        # to compensate for cubic-spline overshoot during smooth interp.
+        dims = np.array(BROV_CUBOID_DIMS, dtype=np.float64)
+        half_v = np.maximum(np.ceil(dims / (2.0 * coarse_res)).astype(np.intp), 1)
+        half_v += SPLINE_SAFETY_VOXELS
+        reservation = ReservationTable(coarse_grid.shape, T_max, half_v)
+
+        logger.info("[executor] Coarse grid %s  T=%d  half_v=%s  "
+                    "reservation %.1f MB",
+                    coarse_grid.shape, T_max, half_v,
+                    reservation._data.nbytes / 1e6)
+
+        # ── 2. Priority ordering: longest route first ─────────────────
+        # Estimate route cost from path_cache or Euclidean distance
+        route_costs: List[float] = []
+        for i, route in enumerate(routes):
+            cost = 0.0
+            for leg in range(1, len(route)):
+                a, b = route[leg - 1], route[leg]
+                if path_cache and (a, b) in path_cache:
+                    pc = path_cache[(a, b)]
+                    cost += float(np.sum(np.linalg.norm(np.diff(pc, axis=0), axis=1)))
+                else:
+                    cost += float(np.linalg.norm(
+                        waypoints_world[b, :3] - waypoints_world[a, :3]))
+            route_costs.append(cost)
+
+        priority_order = sorted(range(n_robots), key=lambda i: -route_costs[i])
+        logger.info("[executor] Priority order (longest first): %s  costs=%s",
+                    priority_order, [f"{route_costs[i]:.1f}" for i in priority_order])
+
+        # ── 3. Plan each robot sequentially ───────────────────────────
+        # Stores per-robot coarse-resolution results
+        robot_world_paths: List[Optional[np.ndarray]] = [None] * n_robots
+        robot_coarse_times: List[Optional[np.ndarray]] = [None] * n_robots
+        robot_wp_schedules: List[Optional[list]] = [None] * n_robots
+        for priority, robot_idx in enumerate(priority_order):
+            route = routes[robot_idx]
+            logger.info("[executor] Planning robot %d (priority %d/%d, "
+                        "%d legs, est. %.1fm) …",
+                        robot_idx, priority + 1, n_robots,
+                        len(route) - 1, route_costs[robot_idx])
+
+            world_xyz, coarse_t, wp_schedule = plan_robot_route_st(
+                coarse_grid, coarse_origin, coarse_res,
+                reservation, route, waypoints_world,
+                path_cache=path_cache,
+                dwell_s=dwell_s,
+                dt=SPACE_TIME_DT,
+                fine_og=self.og,
+                robot_radius=ROBOT_RADIUS,
+            )
+
+            if len(world_xyz) == 0:
+                logger.warning("  Robot %d: ST planning returned empty path!",
+                               robot_idx)
+            else:
+                logger.info("  Robot %d: %d coarse samples, t=[%d..%d] "
+                            "(%.1f s)",
+                            robot_idx, len(world_xyz),
+                            int(coarse_t[0]), int(coarse_t[-1]),
+                            float(coarse_t[-1]) * SPACE_TIME_DT)
+
+            robot_world_paths[robot_idx] = world_xyz
+            robot_coarse_times[robot_idx] = coarse_t
+            robot_wp_schedules[robot_idx] = wp_schedule
+
+        # ── 4. Smooth-interpolate to replay resolution ────────────────
         all_traj_positions:  List[List[np.ndarray]] = [[] for _ in range(n_robots)]
         all_traj_velocities: List[List[np.ndarray]] = [[] for _ in range(n_robots)]
-        committed_xyz:        Dict[int, List]        = {i: [] for i in range(n_robots)}
-        current_js     = [c.copy() for c in self.start_configs]
-        fail_counts    = [0] * n_robots
+        fail_counts = [0] * n_robots
 
-        # Convenient helpers -------------------------------------------------
+        for i in range(n_robots):
+            w_xyz = robot_world_paths[i]
+            c_t   = robot_coarse_times[i]
+            cfg   = self.start_configs[i].copy()  # 8-DOF
+            wp_sched = robot_wp_schedules[i] or []
+            # Convert coarse time-step schedule → seconds
+            wp_sched_s = [
+                (int(ts) * SPACE_TIME_DT, int(te) * SPACE_TIME_DT, node)
+                for ts, te, node in wp_sched
+            ]
 
-        def _append_traj(robot_i: int, pos_np: np.ndarray, vel_np: np.ndarray):
-            for sp, sv in zip(pos_np, vel_np):
-                all_traj_positions[robot_i].append(sp)
-                all_traj_velocities[robot_i].append(sv)
-            committed_xyz[robot_i].extend(pos_np[:, :3].tolist())
+            if w_xyz is None or len(w_xyz) == 0:
+                # Nothing planned – hold at home
+                fail_counts[i] = len(routes[i]) - 1
+                for _ in range(50):
+                    all_traj_positions[i].append(cfg.astype(np.float32).copy())
+                    all_traj_velocities[i].append(np.zeros_like(cfg, dtype=np.float32))
+                continue
 
-        def _append_hold(robot_i: int, steps: int):
-            cfg      = current_js[robot_i]
-            zero_vel = np.zeros_like(cfg)
-            for _ in range(steps):
-                all_traj_positions[robot_i].append(cfg.copy())
-                all_traj_velocities[robot_i].append(zero_vel.copy())
-            committed_xyz[robot_i].extend([cfg[:3].tolist()] * steps)
+            # Convert coarse time-steps → continuous seconds
+            t_seconds = c_t.astype(np.float64) * SPACE_TIME_DT
+            t0, tf = float(t_seconds[0]), float(t_seconds[-1])
+            duration = tf - t0
 
-        def _update_obstacle_poses(planner_idx: int):
-            """Place static cuboids for other robots at their current pos."""
-            try:
-                from curobo.types.math import Pose  # type: ignore
-                tensor_args = self.motion_gens[planner_idx].tensor_args
-                for j in range(n_robots):
-                    if j == planner_idx:
-                        continue
-                    obs_pose = Pose(
-                        position=tensor_args.to_device(current_js[j][:3]),
-                        quaternion=tensor_args.to_device(
-                            np.array([1.0, 0.0, 0.0, 0.0])
-                        ),
-                    )
-                    self.motion_gens[planner_idx].world_coll_checker \
-                        .update_obstacle_pose(
-                            name=f"robot_obs_{j}", w_obj_pose=obs_pose
-                        )
-            except Exception as exc:
-                logger.debug("[executor] update_obstacle_poses skipped: %s", exc)
+            if duration < 1e-6:
+                traj_js = np.tile(cfg.astype(np.float64), (1, 1))
+                traj_js[0, :3] = w_xyz[-1]
+                t_dense = np.array([t0])
+            else:
+                n_steps = max(2, int(np.ceil(duration / TRAJ_DT)))
+                t_dense = np.linspace(t0, tf, n_steps)
+                # Remove duplicate time stamps from dwells
+                _, unique_idx = np.unique(t_seconds, return_index=True)
+                unique_idx = np.sort(unique_idx)
+                t_uniq = t_seconds[unique_idx]
+                xyz_uniq = w_xyz[unique_idx]
+                # Linear densification – path is already OMPL-smooth
+                xyz_dense = np.column_stack([
+                    np.interp(t_dense, t_uniq, xyz_uniq[:, d]) for d in range(3)
+                ])
+                traj_js = np.tile(cfg.astype(np.float64), (n_steps, 1))
+                traj_js[:, :3] = xyz_dense
 
-        def _set_traj_obstacles(planner_idx: int):
-            """Feed trajectory OBBs from committed robots into planner."""
-            try:
-                from curobo.types.base import TensorDeviceType  # type: ignore
-                tensor_args = self.motion_gens[planner_idx].tensor_args
-                planner_start_step = len(all_traj_positions[planner_idx])
-                dims, poses, enable, n = build_traj_obb_tensors(
-                    committed_xyz, planner_idx, planner_start_step,
-                    tensor_args, TRAJOPT_HORIZON,
-                )
-                wcc = self.motion_gens[planner_idx].world_coll_checker
-                if n == 0:
-                    wcc.clear_trajectory_obstacles()
-                else:
-                    wcc.set_trajectory_obstacles(dims, poses, enable)
-            except Exception as exc:
-                logger.debug("[executor] set_traj_obstacles skipped: %s", exc)
+            # Orientation: interpolate yaw/pitch between consecutive waypoints
+            _apply_heading_orientation(
+                traj_js,
+                t_dense=t_dense,
+                dt=TRAJ_DT,
+                wp_schedule_s=wp_sched_s,
+                waypoints_world=waypoints_world,
+            )
 
-        # ── Get wait counts from traffic plan ─────────────────────────
-        wait_counts: List[List[int]] = (
-            traffic_plan.wait_counts
-            if traffic_plan is not None
-            else [[0] * len(r) for r in routes]
-        )
+            # Finite-difference velocities
+            vel = np.zeros_like(traj_js)
+            if len(traj_js) > 1:
+                vel[:-1] = np.diff(traj_js, axis=0) / TRAJ_DT
 
-        # ── Main planning loop – one waypoint at a time ───────────────
-        max_wps = max(len(r) for r in all_waypoints) if all_waypoints else 0
-        for wp_idx in range(max_wps):
-            logger.info("── Waypoint %d ──", wp_idx)
+            for sp, sv in zip(traj_js, vel):
+                all_traj_positions[i].append(sp.astype(np.float32))
+                all_traj_velocities[i].append(sv.astype(np.float32))
 
-            for i in range(n_robots):
-                route_i = all_waypoints[i]
-                if wp_idx >= len(route_i):
-                    continue   # robot has fewer waypoints
-
-                wp        = route_i[wp_idx]
-                wait_here = (wait_counts[i][wp_idx]
-                             if wp_idx < len(wait_counts[i]) else 0)
-
-                _update_obstacle_poses(i)
-                _set_traj_obstacles(i)
-
-                goal_pose = np.array(wp[:7], dtype=np.float32)
-                start_js  = current_js[i]
-
-                # ── Traffic-light pre-wait ────────────────────────────
-                if wait_here > 0:
-                    logger.info("  Robot %d: holding %d steps before wp %d.",
-                                i, wait_here, wp_idx)
-                    _append_hold(i, wait_here)
-
-                # ── Plan segment with hybrid planner ──────────────────
-                seg: Optional[SegmentResult] = None
-                for attempt in range(MAX_REPLAN_ATTEMPTS):
-                    seg = self.planners[i].plan_segment(start_js, goal_pose)
-                    if seg.success:
-                        break
-                    logger.warning("  Robot %d, wp %d attempt %d failed.",
-                                   i, wp_idx, attempt)
-
-                if seg is None or not seg.success:
-                    fail_counts[i] += 1
-                    logger.error("  Robot %d → wp %d FAILED after %d attempts.",
-                                 i, wp_idx, MAX_REPLAN_ATTEMPTS)
-                    _append_hold(i, WAIT_STEPS)
-                    continue
-
-                # Commit trajectory
-                if seg.joint_trajectory is not None:
-                    pos_np = seg.joint_trajectory.astype(np.float32)
-                    vel_np = np.zeros_like(pos_np)
-                    if len(pos_np) > 1:
-                        vel_np[:-1] = np.diff(pos_np, axis=0)
-                else:
-                    # RRT* path – encode as prismatic moves (xyz joints 0-2)
-                    pos_np = np.tile(current_js[i], (len(seg.positions), 1))
-                    for s_idx, xyz in enumerate(seg.positions):
-                        pos_np[s_idx, 0] = float(xyz[0])
-                        pos_np[s_idx, 1] = float(xyz[1])
-                        pos_np[s_idx, 2] = float(xyz[2])
-                    vel_np = np.zeros_like(pos_np)
-                    if len(pos_np) > 1:
-                        vel_np[:-1] = np.diff(pos_np, axis=0)
-
-                _append_traj(i, pos_np, vel_np)
-                current_js[i] = pos_np[-1].copy()
-
-                _append_hold(i, WAIT_STEPS)
-                self.motion_gens[i].world_coll_checker.clear_trajectory_obstacles()
-
-                logger.info(
-                    "  Robot %d → wp %d OK (planner=%s, steps=%d).",
-                    i, wp_idx, seg.planner, len(pos_np),
-                )
-
-        # ── Post-planning AABB collision check ────────────────────────
-        _run_post_check(all_traj_positions, fail_counts)
+        # ── 5. Safety AABB check (should be clean) ────────────────────
+        collisions = find_trajectory_collisions(all_traj_positions,
+                                                np.array(BROV_CUBOID_DIMS, dtype=np.float32))
+        if collisions:
+            logger.warning("[executor] %d residual AABB collision(s) after "
+                           "priority-based planning (logged for diagnostics).",
+                           len(collisions))
+        else:
+            logger.info("[executor] No residual AABB collisions – clean plan.")
 
         return ExecutionResult(
             all_traj_positions  = all_traj_positions,
@@ -297,31 +302,106 @@ class RouteExecutor:
         )
 
 
-# ─── Post-planning AABB check ────────────────────────────────────────────────
+# ─── Orientation: interpolate yaw between consecutive waypoints ─────────────
 
-def _run_post_check(
-    all_traj_positions: List[List[np.ndarray]],
-    fail_counts:        List[int],
-) -> None:
-    """Log AABB inter-robot collisions detected in the committed trajectories."""
-    # Collect all robot XYZ per step
-    min_len = min(len(t) for t in all_traj_positions)
-    if min_len == 0:
-        return
+def _apply_heading_orientation(
+    traj: np.ndarray,
+    t_dense: np.ndarray,
+    dt: float = TRAJ_DT,
+    wp_schedule_s: Optional[list] = None,
+    waypoints_world: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Set yaw (joint 3) and camera pitch (joint 7) on a dense trajectory.
 
-    robot_xyz: List[np.ndarray] = []
-    for traj in all_traj_positions:
-        xyz = np.array([s[:3] for s in traj[:min_len]], dtype=np.float32)
-        robot_xyz.append(xyz)
+    During dwell windows the robot holds the waypoint's viewing direction
+    derived from the waypoint quaternion.  Between dwells the yaw and camera
+    pitch are cosine-eased between successive waypoint values.
 
-    collisions = find_trajectory_collisions(robot_xyz, BROV_CUBOID_DIMS)
-    if collisions:
-        logger.warning(
-            "[post_check] %d AABB inter-robot collision(s) detected:",
-            len(collisions),
-        )
-        for step, a, b, pen in collisions:
-            logger.warning("  step=%d  robots (%d, %d)  penetration=%.3fm",
-                           step, a, b, pen)
-    else:
-        logger.info("[post_check] No AABB collisions detected.")
+    Joint layout: [x, y, z, yaw, pitch, roll, cam_yaw, cam_pitch]
+    """
+    N = len(traj)
+    if N < 2:
+        return traj
+
+    yaw          = np.empty(N)
+    camera_pitch = np.zeros(N)
+
+    if not wp_schedule_s or waypoints_world is None:
+        yaw[:] = traj[0, 3]
+        traj[:, 3] = (yaw + math.pi) % (2 * math.pi) - math.pi
+        return traj
+
+    # ── Extract per-waypoint yaw and camera pitch ────────────────────────────
+    wp_yaws:   list = []
+    wp_cpitch: list = []
+    wp_t_ds:   list = []
+    wp_t_de:   list = []
+
+    for (t_ds, t_de, node_idx) in wp_schedule_s:
+        wp7 = waypoints_world[node_idx]
+        qw = float(wp7[3]); qx = float(wp7[4])
+        qy = float(wp7[5]); qz = float(wp7[6])
+        # Rotate +X by quaternion → camera forward direction
+        fx = 1.0 - 2.0 * (qy * qy + qz * qz)
+        fy = 2.0 * (qx * qy + qw * qz)
+        fz = 2.0 * (qx * qz - qw * qy)
+        xy_norm = math.sqrt(fx * fx + fy * fy)
+        wp_yaws.append(math.atan2(fy, fx))
+        wp_cpitch.append(-math.atan2(fz, xy_norm) if xy_norm > 1e-9 else 0.0)
+        wp_t_ds.append(t_ds)
+        wp_t_de.append(t_de)
+
+    # Unwrap waypoint yaw sequence so interpolation always takes the short arc
+    wp_yaws = list(np.unwrap(wp_yaws))
+
+    n_wp = len(wp_schedule_s)
+
+    def _dense_idx(t: float, side: str = "left") -> int:
+        return max(0, min(int(np.searchsorted(t_dense, t, side=side)), N))
+
+    # ── Before first waypoint: hold first waypoint yaw ──────────────────────
+    d_start_0 = _dense_idx(wp_t_ds[0])
+    yaw[:d_start_0]          = wp_yaws[0]
+    camera_pitch[:d_start_0] = 0.0
+
+    # ── Fill dwell windows and transit segments ──────────────────────────────
+    for i in range(n_wp):
+        d_start = _dense_idx(wp_t_ds[i])
+        d_end   = _dense_idx(wp_t_de[i], side="right")
+
+        # Dwell: exact waypoint orientation
+        yaw[d_start:d_end]          = wp_yaws[i]
+        camera_pitch[d_start:d_end] = wp_cpitch[i]
+
+        if i < n_wp - 1:
+            # Transit: cosine-ease from wp[i] to wp[i+1]
+            next_start = _dense_idx(wp_t_ds[i + 1])
+            if next_start > d_end:
+                ts   = t_dense[d_end:next_start]
+                t0_t = t_dense[d_end]
+                t1_t = t_dense[min(next_start, N - 1)]
+                dur  = t1_t - t0_t
+                if dur > 0:
+                    alpha = (ts - t0_t) / dur
+                    ease  = 0.5 * (1.0 - np.cos(math.pi * alpha))
+                    yaw[d_end:next_start]          = (wp_yaws[i]
+                        + ease * (wp_yaws[i + 1] - wp_yaws[i]))
+                    camera_pitch[d_end:next_start] = (wp_cpitch[i]
+                        + ease * (wp_cpitch[i + 1] - wp_cpitch[i]))
+                else:
+                    yaw[d_end:next_start]          = wp_yaws[i]
+                    camera_pitch[d_end:next_start] = wp_cpitch[i]
+        else:
+            # After last waypoint: hold last waypoint yaw
+            yaw[d_end:]          = wp_yaws[i]
+            camera_pitch[d_end:] = 0.0
+
+    # ── Write back ───────────────────────────────────────────────────────────
+    # Write unwrapped yaw directly — do NOT wrap to [-π, π].
+    # Wrapping creates a discontinuity when the interpolated yaw crosses ±π,
+    # causing the joint controller to reverse direction mid-transit.
+    traj[:, 3] = yaw
+    if traj.shape[1] > 7:
+        traj[:, 7] = camera_pitch
+    return traj
+

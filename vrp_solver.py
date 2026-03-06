@@ -16,13 +16,14 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 
 import numpy as np
 
@@ -59,20 +60,50 @@ class VRPResult:
     status:     str     = "success"
 
 
-# ─── Shared helper ───────────────────────────────────────────────────────────
+# ─── Shared helpers ──────────────────────────────────────────────────────────
+
+def _normalise_depot(
+    depot: Union[int, List[int]], num_vehicles: int
+) -> List[int]:
+    """Return a per-vehicle depot list regardless of input type."""
+    if isinstance(depot, (list, tuple)):
+        return [int(d) for d in depot]
+    return [int(depot)] * num_vehicles
+
 
 def _compute_route_cost(routes: List[List[int]],
                         dist_matrix: np.ndarray,
-                        depot: int = 0) -> float:
+                        depot: Union[int, List[int]] = 0) -> float:
     """Sum travel distances for all vehicles."""
+    depots = _normalise_depot(depot, len(routes))
     total = 0.0
-    for route in routes:
+    for v, route in enumerate(routes):
         if not route:
             continue
-        full = [depot] + list(route) + [depot]
+        d = depots[v]
+        full = [d] + list(route) + [d]
         for a, b in zip(full[:-1], full[1:]):
             total += float(dist_matrix[a, b])
     return total
+
+
+def _per_vehicle_costs(
+    routes: List[List[int]],
+    dist_matrix: np.ndarray,
+    depot: Union[int, List[int]] = 0,
+) -> List[float]:
+    """Return per-vehicle travel distances (for makespan computation)."""
+    depots = _normalise_depot(depot, len(routes))
+    costs: List[float] = []
+    for v, route in enumerate(routes):
+        c = 0.0
+        if route:
+            d = depots[v]
+            full = [d] + list(route) + [d]
+            for a, b in zip(full[:-1], full[1:]):
+                c += float(dist_matrix[a, b])
+        costs.append(c)
+    return costs
 
 
 # ─── GPU / cuOpt backend ─────────────────────────────────────────────────────
@@ -108,7 +139,7 @@ class GPUSolver:
         self,
         dist_matrix:   np.ndarray,
         num_vehicles:  int,
-        depot:         int = 0,
+        depot:         Union[int, List[int]] = 0,
     ) -> VRPResult:
         """Run cuOpt VRP inside the ``rapids_solver`` subprocess.
 
@@ -119,17 +150,40 @@ class GPUSolver:
         num_vehicles:
             Number of AUVs / robots.
         depot:
-            Index of the depot node (all vehicles start and end here).
+            Depot index (int) shared by all vehicles, or a list of
+            per-vehicle depot indices.
         """
+        depots = _normalise_depot(depot, num_vehicles)
+
+        result = self._call_cuopt(dist_matrix, num_vehicles, depots)
+        if result.status == "success":
+            per_v    = _per_vehicle_costs(result.routes, dist_matrix, depots)
+            makespan = max(per_v) if per_v else 0.0
+            logger.info("[GPUSolver] makespan=%.2f  per_vehicle=%s",
+                        makespan, [f"{c:.1f}" for c in per_v])
+        return result
+
+    # ── Internal cuOpt subprocess call ───────────────────────────────
+    def _call_cuopt(
+        self,
+        dist_matrix: np.ndarray,
+        num_vehicles: int,
+        depots: List[int],
+    ) -> VRPResult:
+        """Single cuOpt subprocess invocation."""
         n = dist_matrix.shape[0]
+        depot_set = set(depots)
+        n_inspection = n - len(depot_set)
+        # Exact ceil(n/k) — no slack, forces cuOpt to distribute stops evenly
+        balanced_cap = math.ceil(n_inspection / num_vehicles)
 
         cfg = {
-            "n":               n,
-            "num_vehicles":    num_vehicles,
-            "service_time":    self.service_time,
-            "vehicle_capacity": n,
-            "depot":           depot,
-            "distance_matrix": dist_matrix.flatten().tolist(),
+            "n":                n,
+            "num_vehicles":     num_vehicles,
+            "service_time":     self.service_time,
+            "vehicle_capacity": balanced_cap,
+            "depot":            depots,
+            "distance_matrix":  dist_matrix.flatten().tolist(),
         }
 
         with tempfile.NamedTemporaryFile(
@@ -168,7 +222,7 @@ class GPUSolver:
                                  solver="cuopt", status=result.get("status", "unknown"))
 
             routes    = result["routes"]
-            total_c   = _compute_route_cost(routes, dist_matrix, depot)
+            total_c   = _compute_route_cost(routes, dist_matrix, depots)
             logger.info("[GPUSolver] cuOpt solved. total_cost=%.2f  routes=%s",
                         total_c, routes)
             return VRPResult(routes=routes, total_cost=total_c,
@@ -199,10 +253,14 @@ class ORToolsSolver:
     ----------
     time_limit:
         Maximum seconds for the local-search phase.
+    span_cost_coefficient:
+        Weight applied to ``SetGlobalSpanCostCoefficient`` on the Distance
+        dimension.  Higher values more aggressively equalise route lengths.
     """
 
-    def __init__(self, time_limit: int = 60):
-        self.time_limit = time_limit
+    def __init__(self, time_limit: int = 60, span_cost_coefficient: int = 100):
+        self.time_limit            = time_limit
+        self.span_cost_coefficient = span_cost_coefficient
 
     # ------------------------------------------------------------------
 
@@ -210,7 +268,7 @@ class ORToolsSolver:
         self,
         dist_matrix:  np.ndarray,
         num_vehicles: int,
-        depot:        int = 0,
+        depot:        Union[int, List[int]] = 0,
     ) -> VRPResult:
         """Solve capacitated VRP with OR-Tools GUIDED_LOCAL_SEARCH.
 
@@ -221,8 +279,11 @@ class ORToolsSolver:
         num_vehicles:
             Number of AUVs / robots.
         depot:
-            Index of the depot node.
+            Depot index (int) shared by all vehicles, or a list of
+            per-vehicle depot indices.
         """
+        depots = _normalise_depot(depot, num_vehicles)
+
         try:
             from ortools.constraint_solver import pywrapcp, routing_enums_pb2
         except ImportError as exc:
@@ -234,7 +295,8 @@ class ORToolsSolver:
         # OR-Tools requires integer distances
         int_matrix = (dist_matrix * 1000).astype(int)
 
-        manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depot)
+        # Multi-depot: each vehicle has its own start/end node
+        manager = pywrapcp.RoutingIndexManager(n, num_vehicles, depots, depots)
         routing = pywrapcp.RoutingModel(manager)
 
         def distance_callback(from_idx, to_idx):
@@ -245,13 +307,34 @@ class ORToolsSolver:
         cb_idx = routing.RegisterTransitCallback(distance_callback)
         routing.SetArcCostEvaluatorOfAllVehicles(cb_idx)
 
-        # Dimension: distance
+        depot_set = set(depots)
+
+        # Dimension: distance — also penalise imbalance via span cost
         routing.AddDimension(
             cb_idx,
             0,                # no slack
             10_000_000,       # large upper bound
             True,             # start cumul at zero
             "Distance",
+        )
+        dist_dim = routing.GetDimensionOrDie("Distance")
+        dist_dim.SetGlobalSpanCostCoefficient(self.span_cost_coefficient)
+
+        # Dimension: stop count — hard-cap each vehicle at balanced load
+        n_inspection = n - len(depot_set)
+        balanced_cap = math.ceil(n_inspection / num_vehicles) + 1
+
+        def count_callback(from_idx, to_idx):
+            node = manager.IndexToNode(to_idx)
+            return 0 if node in depot_set else 1
+
+        count_cb_idx = routing.RegisterTransitCallback(count_callback)
+        routing.AddDimension(
+            count_cb_idx,
+            0,             # no slack
+            balanced_cap,  # max stops per vehicle
+            True,          # start at zero
+            "StopCount",
         )
 
         search_params = pywrapcp.DefaultRoutingSearchParameters()
@@ -278,12 +361,12 @@ class ORToolsSolver:
             idx = routing.Start(v)
             while not routing.IsEnd(idx):
                 node = manager.IndexToNode(idx)
-                if node != depot:
+                if node not in depot_set:
                     route.append(node)
                 idx = solution.Value(routing.NextVar(idx))
             routes.append(route)
 
-        total_c = _compute_route_cost(routes, dist_matrix, depot)
+        total_c = _compute_route_cost(routes, dist_matrix, depots)
         logger.info("[ORToolsSolver] Solved. total_cost=%.2f  routes=%s",
                     total_c, routes)
         return VRPResult(routes=routes, total_cost=total_c,
@@ -293,14 +376,15 @@ class ORToolsSolver:
 # ─── Unified solver selector ─────────────────────────────────────────────────
 
 def solve_vrp(
-    dist_matrix:   np.ndarray,
-    num_vehicles:  int,
-    depot:         int = 0,
-    backend:       str = "auto",
-    rapids_python: str = RAPIDS_PYTHON,
-    service_time:  float = CUOPT_SERVICE_TIME,
-    time_limit:    int = 60,
-    gpu_timeout:   int = 300,
+    dist_matrix:           np.ndarray,
+    num_vehicles:          int,
+    depot:                 Union[int, List[int]] = 0,
+    backend:               str = "auto",
+    rapids_python:         str = RAPIDS_PYTHON,
+    service_time:          float = CUOPT_SERVICE_TIME,
+    time_limit:            int = 60,
+    gpu_timeout:           int = 300,
+    span_cost_coefficient: int = 100,
 ) -> VRPResult:
     """Unified entry-point for VRP solving.
 
@@ -311,7 +395,8 @@ def solve_vrp(
     num_vehicles:
         Number of AUVs / robots.
     depot:
-        Starting node index for all robots.
+        Single depot index (int) for all robots, or a per-vehicle
+        list of depot indices (length = num_vehicles).
     backend:
         ``"auto"`` – try cuOpt, fall back to OR-Tools on failure.
         ``"cuopt"`` – use cuOpt only.
@@ -337,7 +422,10 @@ def solve_vrp(
                        result.status)
 
     if use_ortools:
-        cpu_solver = ORToolsSolver(time_limit=time_limit)
+        cpu_solver = ORToolsSolver(
+            time_limit=time_limit,
+            span_cost_coefficient=span_cost_coefficient,
+        )
         return cpu_solver.solve(dist_matrix, num_vehicles, depot)
 
     return VRPResult(routes=[], total_cost=float("inf"),

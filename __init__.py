@@ -13,6 +13,7 @@ from VRP.config import (
     CUROBO_FIX_TERMINAL_ACTION,
     RAPIDS_PYTHON,
 )
+from VRP.utils import save_solution, load_solution
 
 __all__ = [
     "config",
@@ -27,4 +28,8 @@ __all__ = [
     "route_executor",
     "visualization",
     "vrp_planner",
+    "visualize_solution",
+    # helpers
+    "save_solution",
+    "load_solution",
 ]

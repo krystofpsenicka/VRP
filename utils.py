@@ -5,15 +5,15 @@ Ported helpers from brov_auv_curobo/run_multi_auv_waypoints.py:
   • load_local_robot_config()
   • generate_random_waypoints()
   • build_world_config_for_robot()
-  • _resample_positions_to_horizon()
-  • _build_traj_obb_tensors()
+  • resample_positions_to_horizon()
   • aabb_overlap()
+  • find_trajectory_collisions()
 """
 
 from __future__ import annotations
 import os
 import sys
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -21,18 +21,15 @@ from VRP.config import (
     ASSETS_PATH,
     BROV_CUBOID_DIMS,
     CONFIGS_PATH,
-    OBSTACLE_CUBOID_DIMS,
     ROBOT_CFG_DIR,
     STATIC_OBSTACLES,
-    TRAJOPT_HORIZON,
 )
-
 # ---------------------------------------------------------------------------
 # cuRobo imports (optional – utils should still be importable without them
 # to allow waypoint / grid work without a full cuRobo GPU env)
 # ---------------------------------------------------------------------------
 try:
-    from curobo.geom.types import WorldConfig
+    from curobo.geom.types import VoxelGrid, WorldConfig
     from curobo.types.math import Pose
     from curobo.util_file import load_yaml
     _CUROBO_AVAILABLE = True
@@ -97,26 +94,125 @@ def generate_random_waypoints(
 
 # ── World configuration ───────────────────────────────────────────────────────
 
-def build_world_config_for_robot(robot_idx: int, num_robots: int):
-    """Build a WorldConfig with static obstacles + per-robot placeholder cuboids.
+def compute_esdf(og) -> "torch.Tensor":
+    """Compute a signed distance field from the occupancy grid.
 
-    Each robot gets a ``WorldConfig`` that contains:
-    • All static environment obstacles (rocks, coral).
-    • One inflated placeholder cuboid for every *other* robot, spawned
-      far away at ``[100 + j, 100, 100]`` and moved to real positions
-      at planning time via ``update_obstacle_pose``.
+    Uses ``scipy.ndimage.distance_transform_edt`` on the *raw* (pre-inflation)
+    obstacle grid so cuRobo's collision sphere radii are not double-counted.
+
+    Convention (cuRobo):
+        * **positive** inside obstacles
+        * **negative** in free space
+
+    Returns
+    -------
+    torch.Tensor
+        Flat float32 tensor of length ``prod(raw_grid.shape)`` (C-order).
+    """
+    import torch
+    from scipy.ndimage import distance_transform_edt
+
+    raw = og.raw_grid if og.raw_grid is not None else og.grid
+    # Distance from every free voxel to nearest obstacle surface
+    outside_dist = distance_transform_edt(~raw) * og.resolution
+    # Distance from every obstacle voxel to nearest free surface
+    inside_dist  = distance_transform_edt(raw)  * og.resolution
+    # cuRobo convention: positive inside obstacle, negative outside
+    esdf = (inside_dist - outside_dist).astype(np.float32)
+    return torch.from_numpy(esdf.ravel())
+
+
+def build_esdf_voxel_grid(og) -> "VoxelGrid":
+    """Build a cuRobo :class:`VoxelGrid` from an :class:`OccupancyGrid`.
+
+    The ESDF is computed from the raw (pre-inflation) grid.  The returned
+    ``VoxelGrid`` can be embedded into a ``WorldConfig`` and consumed by
+    ``CollisionCheckerType.VOXEL``.
     """
     if not _CUROBO_AVAILABLE:
         raise RuntimeError("cuRobo is not available in this environment.")
+    import torch
+
+    esdf_tensor = compute_esdf(og)
+    raw = og.raw_grid if og.raw_grid is not None else og.grid
+    # cuRobo's get_grid_shape: grid_cells[i] = 1 + robust_floor(dims[i] / voxel_size)
+    # With dims = s*res this yields s+1 cells → feature_tensor shape mismatch.
+    # Using (s - 0.5)*res makes robust_floor return s-1 → 1+(s-1) = s cells ✓
+    dims = [(float(s) - 0.5) * og.resolution for s in raw.shape]   # metres
+    # Centre is the true physical mid-point of the voxel array in world frame
+    phys_extent = [float(s) * og.resolution for s in raw.shape]
+    centre = og.origin + np.array(phys_extent) / 2.0
+    pose = [float(centre[0]), float(centre[1]), float(centre[2]),
+            1.0, 0.0, 0.0, 0.0]
+
+    vg = VoxelGrid(
+        name="ship_esdf",
+        pose=pose,
+        dims=dims,
+        voxel_size=og.resolution,
+        feature_tensor=esdf_tensor,
+        feature_dtype=torch.float32,
+    )
+    print(f"[ESDF] VoxelGrid built: dims={[f'{d:.1f}' for d in dims]}m  "
+          f"voxel_size={og.resolution}m  "
+          f"tensor={esdf_tensor.shape[0]} elements  "
+          f"ESDF range=[{esdf_tensor.min():.3f}, {esdf_tensor.max():.3f}]")
+    return vg
+
+
+def build_world_config_for_robot(
+    robot_idx: int = 0,
+    num_robots: int = 1,
+    robot_start_xyzs: Optional[list] = None,
+    esdf_voxel_grid=None,
+):
+    """Build a WorldConfig with static environment obstacles.
+
+    Includes rocks/coral from ``config.STATIC_OBSTACLES`` plus a static
+    cuboid at every *other* robot's depot/start position.  Placing these
+    obstacles in cuRobo's world prevents trajectories from being routed
+    through the starting positions of sibling robots.
+
+    Parameters
+    ----------
+    robot_idx:
+        Index of the robot this config is built for.
+    num_robots:
+        Total number of robots (used when ``robot_start_xyzs`` is None).
+    robot_start_xyzs:
+        List of ``(3,)`` start XYZ arrays, one per robot.  When provided,
+        a Minkowski-sum cuboid (``BROV_CUBOID_DIMS`` inflated by 1.5×) is
+        placed at each other robot's position.
+    esdf_voxel_grid:
+        Optional cuRobo ``VoxelGrid`` with a pre-computed ESDF of the
+        environment mesh.  When given, the returned ``WorldConfig``
+        includes it so the VOXEL collision checker will use it.
+    """
+    if not _CUROBO_AVAILABLE:
+        raise RuntimeError("cuRobo is not available in this environment.")
+
     cuboids = dict(STATIC_OBSTACLES)
-    for j in range(num_robots):
-        if j == robot_idx:
-            continue
-        cuboids[f"robot_obs_{j}"] = {
-            "dims": OBSTACLE_CUBOID_DIMS,
-            "pose": [100.0 + j, 100.0, 100.0, 1.0, 0.0, 0.0, 0.0],
-        }
-    return WorldConfig.from_dict({"cuboid": cuboids})
+
+    if robot_start_xyzs is not None:
+        # Use a cuboid slightly larger than the robot body so there is
+        # comfortable clearance, but not as large as the full Minkowski sum.
+        obs_dims = [d * 1.5 for d in BROV_CUBOID_DIMS]
+        for j, xyz in enumerate(robot_start_xyzs):
+            if j == robot_idx:
+                continue
+            x, y, z = float(xyz[0]), float(xyz[1]), float(xyz[2])
+            cuboids[f"depot_obs_{j}"] = {
+                "dims": obs_dims,
+                "pose": [x, y, z, 1.0, 0.0, 0.0, 0.0],
+            }
+
+    # Build cuboid objects via the dict helper, then construct WorldConfig
+    # with both cuboids and (optionally) the ESDF voxel grid.
+    cuboid_wc = WorldConfig.from_dict({"cuboid": cuboids})
+    return WorldConfig(
+        cuboid=cuboid_wc.cuboid,
+        voxel=[esdf_voxel_grid] if esdf_voxel_grid is not None else None,
+    )
 
 
 # ── Trajectory resampling ─────────────────────────────────────────────────────
@@ -138,65 +234,6 @@ def resample_positions_to_horizon(
     idx_hi  = np.minimum(idx_lo + 1, T - 1)
     alpha   = (src_idx - idx_lo).reshape(-1, 1)
     return ((1 - alpha) * positions[idx_lo] + alpha * positions[idx_hi]).astype(np.float32)
-
-
-# ── Trajectory OBB tensor builder ─────────────────────────────────────────────
-
-def build_traj_obb_tensors(
-    committed_xyz: Dict[int, List[np.ndarray]],
-    planner_idx: int,
-    planner_start_step: int,
-    tensor_args,
-    horizon: int = TRAJOPT_HORIZON,
-):
-    """Build trajectory OBB tensors from cumulative committed trajectories.
-
-    For each robot ``k != planner_idx`` whose committed trajectory extends
-    beyond ``planner_start_step``, extract the temporally-relevant window
-    and resample it to *horizon* optimiser steps.
-
-    Returns
-    -------
-    traj_obb_dims, traj_obb_poses, traj_obb_enable, n_traj_obbs
-        Ready to pass to ``world_coll_checker.set_trajectory_obstacles``.
-        All four are ``None / 0`` when there are no relevant obstacles.
-    """
-    import torch
-
-    dims_list  = []
-    poses_list = []
-
-    for k, xyz_list in committed_xyz.items():
-        if k == planner_idx:
-            continue
-        total_steps = len(xyz_list)
-        if total_steps <= planner_start_step:
-            continue   # robot k finishes before planner_idx starts this segment
-
-        window    = np.array(xyz_list[planner_start_step:], dtype=np.float32)  # (W, 3)
-        resampled = resample_positions_to_horizon(window, horizon)              # (H, 3)
-
-        dims_list.append(OBSTACLE_CUBOID_DIMS + [0.0])   # [lx, ly, lz, 0]
-
-        # OBB pose per horizon step: [x, y, z, qw, qx, qy, qz, 0]
-        # CuRobo expects the **inverse** object-in-world pose.
-        h_poses = np.zeros((horizon, 8), dtype=np.float32)
-        h_poses[:, :3] = -resampled     # negated XYZ (obj_w convention)
-        h_poses[:, 3]  = 1.0            # qw = 1 (identity rotation)
-        poses_list.append(h_poses)
-
-    n = len(dims_list)
-    if n == 0:
-        return None, None, None, 0
-
-    traj_obb_dims  = tensor_args.to_device(
-        torch.tensor(np.array(dims_list, dtype=np.float32))
-    )   # (n, 4)
-    traj_obb_poses = tensor_args.to_device(
-        torch.tensor(np.stack(poses_list, axis=0))
-    )   # (n, H, 8)
-    traj_obb_enable = torch.ones(n, dtype=torch.uint8, device=traj_obb_dims.device)
-    return traj_obb_dims, traj_obb_poses, traj_obb_enable, n
 
 
 # ── AABB collision check ──────────────────────────────────────────────────────
@@ -229,6 +266,7 @@ def find_trajectory_collisions(
     """
     if dims is None:
         dims = np.array(BROV_CUBOID_DIMS, dtype=np.float32)
+    dims = np.asarray(dims, dtype=np.float32)
     half = dims / 2.0
 
     num_robots  = len(all_traj_positions)
@@ -252,3 +290,46 @@ def find_trajectory_collisions(
                     penetration = float(-np.max(gap))
                     collisions.append((step, a, b, penetration))
     return collisions
+
+
+# ---------------------------------------------------------------------------
+# Solution persistence
+# ---------------------------------------------------------------------------
+
+def save_solution(result: "ExecutionResult", path: str) -> None:  # noqa: F821
+    """Pickle an :class:`~route_executor.ExecutionResult` to *path*.
+
+    The file can later be loaded by :func:`load_solution` in the Isaac Sim
+    environment without needing cuRobo or OR-Tools to be installed.
+
+    Parameters
+    ----------
+    result:
+        The completed execution result returned by
+        :class:`~route_executor.RouteExecutor`.
+    path:
+        Destination file path (``*.pkl`` recommended).
+    """
+    import pickle
+
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, "wb") as fh:
+        pickle.dump(result, fh, protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def load_solution(path: str) -> "ExecutionResult":  # noqa: F821
+    """Load an :class:`~route_executor.ExecutionResult` from a pickle file.
+
+    Parameters
+    ----------
+    path:
+        Path to the ``.pkl`` file written by :func:`save_solution`.
+
+    Returns
+    -------
+    ExecutionResult
+    """
+    import pickle
+
+    with open(path, "rb") as fh:
+        return pickle.load(fh)

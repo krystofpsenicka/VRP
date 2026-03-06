@@ -29,8 +29,6 @@ from typing import List, Optional, Tuple
 
 import numpy as np
 
-from VRP.config import RAPIDS_PYTHON
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # ── CPU A* helpers ────────────────────────────────────────────────────────────
@@ -326,7 +324,7 @@ def compute_distance_matrix(
     waypoints_world: np.ndarray,
     cache_path: Optional[str] = None,
     force_rebuild: bool = False,
-    rapids_python: str = RAPIDS_PYTHON,
+    rapids_python: Optional[str] = None,
 ) -> np.ndarray:
     """Compute the N×N collision-free distance matrix for ``waypoints_world``.
 
@@ -345,6 +343,10 @@ def compute_distance_matrix(
     -------
     matrix : (N, N) float32 in metres.
     """
+    if rapids_python is None:
+        from VRP.config import RAPIDS_PYTHON
+        rapids_python = RAPIDS_PYTHON
+
     if cache_path and not force_rebuild and os.path.exists(cache_path):
         print(f"[DistMatrix] Loading cached matrix from {cache_path}")
         return np.load(cache_path)
@@ -359,7 +361,13 @@ def compute_distance_matrix(
     )
 
     if gpu_ok:
-        matrix = _compute_via_subprocess(og, waypoints_world, rapids_python)
+        try:
+            matrix = _compute_via_subprocess(og, waypoints_world, rapids_python)
+        except Exception as e:
+            print(f"[DistMatrix] cuGraph subprocess error: {e}  → falling back to CPU A* …")
+            matrix = compute_distance_matrix_cpu(
+                og.grid, og.origin, og.resolution, waypoints_world
+            )
     else:
         print("[DistMatrix] cuGraph unavailable, using CPU A* …")
         matrix = compute_distance_matrix_cpu(
@@ -502,6 +510,77 @@ def extract_astar_path(
                 heapq.heappush(open_set, (new_g + h(nbr), nbr))
 
     return np.zeros((0, 3), dtype=np.float32)
+
+
+def build_route_path_cache(
+    og,
+    waypoints_world: np.ndarray,
+    routes: List[List[int]],
+    sub_sample_dist: float = 2.0,
+) -> dict:
+    """Compute A* paths for every (i, j) segment pair used by the routes.
+
+    Only the unique directed pairs actually traversed are computed — not all
+    N² combinations.  Each path is sub-sampled to one point every
+    ``sub_sample_dist`` metres so cuRobo plans short, obstacle-free hops.
+
+    Parameters
+    ----------
+    og:
+        Inflated :class:`OccupancyGrid` used for A* collision checking.
+    waypoints_world:
+        ``(N, 7)`` or ``(N, 3)`` world-frame node positions (only XYZ used).
+    routes:
+        Per-robot ordered node-index lists (depot included).
+    sub_sample_dist:
+        Target spacing between consecutive sub-waypoints in metres.
+
+    Returns
+    -------
+    cache : dict[(int, int), np.ndarray shape (M, 3)]
+    """
+    # Collect unique directed pairs that the routes actually traverse
+    pairs: set = set()
+    for route in routes:
+        for k in range(1, len(route)):
+            pairs.add((route[k - 1], route[k]))
+
+    xyz   = np.asarray(waypoints_world)[:, :3]
+    cache: dict = {}
+
+    for (i, j) in sorted(pairs):
+        path = extract_astar_path(og, xyz[i], xyz[j])
+
+        if len(path) == 0:
+            print(f"[path_cache] WARNING: no A* path {i}\u2192{j} — will plan direct.")
+            cache[(i, j)] = np.array([xyz[i], xyz[j]], dtype=np.float32)
+            continue
+
+        if len(path) <= 2:
+            cache[(i, j)] = path
+            continue
+
+        # Cumulative arc-length along path
+        seg_lens = np.linalg.norm(np.diff(path, axis=0), axis=1).astype(float)
+        cum      = np.concatenate([[0.0], np.cumsum(seg_lens)])
+        total    = cum[-1]
+
+        if total < sub_sample_dist:
+            cache[(i, j)] = path[[0, -1]]
+            continue
+
+        targets = np.arange(0.0, total, sub_sample_dist)
+        picked  = np.unique(
+            np.concatenate([[0],
+                            np.searchsorted(cum, targets),
+                            [len(path) - 1]])
+        ).astype(int)
+        cache[(i, j)] = path[picked]
+        print(f"[path_cache] {i}\u2192{j}: {len(path)} A* pts "
+              f"\u2192 {len(cache[(i, j)])} sub-pts  ({total:.1f} m)")
+
+    print(f"[path_cache] Built paths for {len(cache)} route segments.")
+    return cache
 
 
 # ─────────────────────────────────────────────────────────────────────────────
